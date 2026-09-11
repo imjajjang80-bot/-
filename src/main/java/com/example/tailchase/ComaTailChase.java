@@ -43,20 +43,15 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
             this.chatColor = chatColor;
             this.armorColor = armorColor;
         }
-
-        public TailColor getNext() {
-            TailColor[] values = values();
-            return values[(this.ordinal() + 1) % values.length];
-        }
     }
 
     private final Map<UUID, UUID> masterMap = new HashMap<>(); // 노예 -> 주인
     private final Map<UUID, List<UUID>> slavesMap = new HashMap<>(); // 주인 -> 노예 목록
     private final Map<UUID, TailColor> colorMap = new HashMap<>(); // 플레이어 -> 색상
+    private final List<TailColor> activeColorOrder = new ArrayList<>(); // 게임 참가 색상 순서
 
     private boolean gameStarted = false;
     private Scoreboard board;
-    private Objective objective;
     private final Random random = new Random();
 
     @Override
@@ -71,8 +66,6 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
         ScoreboardManager manager = Bukkit.getScoreboardManager();
         if (manager != null) {
             board = manager.getNewScoreboard();
-            objective = board.registerNewObjective("michaeltail", "dummy", ChatColor.BOLD + "" + ChatColor.LIGHT_PURPLE + "[ 마이콜 꼬리잡기 ]");
-            objective.setDisplaySlot(DisplaySlot.SIDEBAR);
         }
     }
 
@@ -110,6 +103,7 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
         masterMap.clear();
         slavesMap.clear();
         colorMap.clear();
+        activeColorOrder.clear();
         initScoreboard();
 
         Collections.shuffle(players);
@@ -122,6 +116,7 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
 
             slavesMap.put(p.getUniqueId(), new ArrayList<>());
             colorMap.put(p.getUniqueId(), color);
+            activeColorOrder.add(color);
 
             // 이름표 색상 세팅
             setupNameTagColor(p, color);
@@ -134,13 +129,11 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
 
             p.sendMessage(ChatColor.GRAY + "==============================");
             p.sendMessage(ChatColor.GOLD + " 당신의 색상: " + color.chatColor + color.name + ChatColor.GRAY + " (머리 위 이름표 색상 확인)");
-            p.sendMessage(ChatColor.RED + " 타깃(공격대상) 색상: " + color.getNext().chatColor + color.getNext().name);
             p.sendMessage(ChatColor.AQUA + " [팁] 다이아몬드를 들고 우클릭하면 3초간 타깃 방향으로 파란 불꽃이 뻗어나갑니다!");
             p.sendMessage(ChatColor.GRAY + "==============================");
         }
 
         Bukkit.broadcastMessage(ChatColor.GOLD + "[꼬리잡기] 마이콜 꼬리잡기 게임이 시작되었습니다! (랜덤 텔레포트 완료)");
-        updateScoreboard();
 
         for (Player p : Bukkit.getOnlinePlayers()) {
             p.setScoreboard(board);
@@ -164,7 +157,41 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
         team.addEntry(player.getName());
     }
 
-    // 다이아몬드 우클릭 시 파란 불꽃 파티클로 타깃 방향 표시 (4블록, 3초간)
+    private Player getValidNextTarget(Player attacker) {
+        UUID myRoot = getRootMaster(attacker.getUniqueId());
+        TailColor myColor = colorMap.get(myRoot);
+
+        if (myColor == null || activeColorOrder.isEmpty()) return null;
+
+        int myIndex = activeColorOrder.indexOf(myColor);
+        if (myIndex == -1) return null;
+
+        int totalColors = activeColorOrder.size();
+
+        for (int i = 1; i < totalColors; i++) {
+            TailColor nextColor = activeColorOrder.get((myIndex + i) % totalColors);
+
+            for (UUID uuid : colorMap.keySet()) {
+                if (getRootMaster(uuid).equals(uuid) && colorMap.get(uuid) == nextColor) {
+                    Player targetPlayer = Bukkit.getPlayer(uuid);
+                    if (targetPlayer != null && targetPlayer.isOnline()) {
+                        return targetPlayer;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private String getWorldNameFormatted(World.Environment env) {
+        return switch (env) {
+            case NETHER -> "네더(지옥)";
+            case THE_END -> "엔더 월드";
+            default -> "오버월드(오버월드)";
+        };
+    }
+
+    // 다이아몬드 우클릭 시 파란 불꽃 파티클 또는 차원 알림
     @EventHandler
     public void onPlayerInteract(PlayerInteractEvent event) {
         if (!gameStarted) return;
@@ -173,28 +200,28 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
         if (event.getAction() == Action.RIGHT_CLICK_AIR || event.getAction() == Action.RIGHT_CLICK_BLOCK) {
             ItemStack item = event.getItem();
             if (item != null && item.getType() == Material.DIAMOND) {
-                UUID myRoot = getRootMaster(player.getUniqueId());
-                TailColor myColor = colorMap.get(myRoot);
-                TailColor targetColor = myColor.getNext();
-
-                Player targetPlayer = null;
-                for (UUID uuid : colorMap.keySet()) {
-                    if (getRootMaster(uuid).equals(uuid) && colorMap.get(uuid) == targetColor) {
-                        targetPlayer = Bukkit.getPlayer(uuid);
-                        break;
-                    }
-                }
+                Player targetPlayer = getValidNextTarget(player);
 
                 if (targetPlayer != null && targetPlayer.isOnline()) {
                     // 다이아몬드 1개 소모
                     item.setAmount(item.getAmount() - 1);
 
+                    TailColor targetColor = colorMap.get(targetPlayer.getUniqueId());
+
+                    // 다른 차원에 있는 경우 처리
+                    if (!player.getWorld().equals(targetPlayer.getWorld())) {
+                        String worldName = getWorldNameFormatted(targetPlayer.getWorld().getEnvironment());
+                        player.sendMessage(ChatColor.GREEN + "[타깃 추적] " + targetColor.chatColor + targetColor.name + ChatColor.RED + " 타깃이 다른 차원(" + worldName + ")에 있습니다!");
+                        player.playSound(player.getLocation(), Sound.BLOCK_NOTE_BLOCK_BASS, 1.0f, 0.5f);
+                        return;
+                    }
+
+                    // 동일한 차원에 있는 경우 (파란 불꽃 파티클)
                     player.sendMessage(ChatColor.GREEN + "[타깃 추적] " + targetColor.chatColor + targetColor.name + ChatColor.GREEN + " 타깃 방향으로 3초간 파란 불꽃이 발사됩니다!");
                     player.playSound(player.getLocation(), Sound.BLOCK_SOUL_SAND_BREAK, 1.0f, 1.0f);
 
                     final Player finalTarget = targetPlayer;
 
-                    // 3초간 파티클 지속 출력 (0.1초마다 총 30회 실행)
                     new BukkitRunnable() {
                         int ticks = 0;
 
@@ -205,13 +232,17 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
                                 return;
                             }
 
-                            Location startLoc = player.getLocation().add(0, 1.0, 0); // 플레이어 눈/가슴 높이
+                            // 추적 도중 차원을 이동했을 경우 멈춤
+                            if (!player.getWorld().equals(finalTarget.getWorld())) {
+                                this.cancel();
+                                return;
+                            }
+
+                            Location startLoc = player.getLocation().add(0, 1.0, 0);
                             Location targetLoc = finalTarget.getLocation().add(0, 1.0, 0);
 
-                            // 타깃을 향하는 단위 벡터 계산
                             Vector direction = targetLoc.toVector().subtract(startLoc.toVector()).normalize();
 
-                            // 4블록 길이로 파란 불꽃 파티클 생성
                             for (double d = 0.5; d <= 4.0; d += 0.3) {
                                 Location particleLoc = startLoc.clone().add(direction.clone().multiply(d));
                                 player.getWorld().spawnParticle(Particle.SOUL_FIRE_FLAME, particleLoc, 1, 0, 0, 0, 0);
@@ -219,7 +250,7 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
 
                             ticks++;
                         }
-                    }.runTaskTimer(this, 0L, 2L); // 2틱(0.1초) 주기로 3초간 실행
+                    }.runTaskTimer(this, 0L, 2L);
 
                 } else {
                     player.sendMessage(ChatColor.RED + "현재 추적 가능한 타깃 플레이어를 찾을 수 없거나 접속 중이 아닙니다.");
@@ -263,10 +294,8 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
                 return;
             }
 
-            TailColor attackerColor = colorMap.get(attackerRoot);
-            TailColor victimColor = colorMap.get(victimRoot);
-
-            if (attackerColor.getNext() != victimColor) {
+            Player validTarget = getValidNextTarget(attacker);
+            if (validTarget == null || !getRootMaster(validTarget.getUniqueId()).equals(victimRoot)) {
                 event.setCancelled(true);
                 attacker.sendMessage(ChatColor.RED + "지정된 타깃만 공격할 수 있습니다!");
             }
@@ -290,7 +319,6 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
 
                 TailColor masterColor = colorMap.get(killerRoot);
 
-                // 노예로 전락한 플레이어는 주인의 색상 가죽갑옷 입히기
                 setLeatherArmor(victim, masterColor.armorColor);
 
                 String killerName = Bukkit.getPlayer(killerRoot) != null ? Bukkit.getPlayer(killerRoot).getName() : killer.getName();
@@ -300,7 +328,6 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
                         ChatColor.YELLOW + " 님이 " + ChatColor.RED + victimName +
                         ChatColor.YELLOW + " 님을 제압하여 노예로 삼았습니다!");
 
-                updateScoreboard();
                 checkWinCondition();
             }
         }
@@ -338,6 +365,7 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
         masterMap.clear();
         slavesMap.clear();
         colorMap.clear();
+        activeColorOrder.clear();
 
         World overworld = Bukkit.getWorlds().get(0);
         int spawnY = overworld.getHighestBlockYAt(0, 0) + 1;
@@ -346,7 +374,6 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
         for (Player p : Bukkit.getOnlinePlayers()) {
             p.getInventory().setArmorContents(null);
             p.setScoreboard(Bukkit.getScoreboardManager().getMainScoreboard());
-            // 게임 종료 시 0, 0 위치로 이동
             p.teleport(spawnLoc);
         }
     }
@@ -368,34 +395,7 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
 
         p.getInventory().setHelmet(helmet);
         p.getInventory().setChestplate(chest);
-        p.getInventory().setLeggings(legs);
+        p.getInventory().setLeggings(leggings);
         p.getInventory().setBoots(boots);
-    }
-
-    private void updateScoreboard() {
-        if (objective == null) return;
-
-        for (String entry : board.getEntries()) {
-            board.resetScores(entry);
-        }
-
-        int scoreIndex = 15;
-        Set<UUID> rootMasters = new HashSet<>();
-        for (UUID uuid : colorMap.keySet()) {
-            rootMasters.add(getRootMaster(uuid));
-        }
-
-        for (UUID masterUUID : rootMasters) {
-            Player master = Bukkit.getPlayer(masterUUID);
-            if (master == null) continue;
-
-            TailColor color = colorMap.get(masterUUID);
-            int slaveCount = slavesMap.getOrDefault(masterUUID, new ArrayList<>()).size();
-
-            String text = color.chatColor + master.getName() + ChatColor.WHITE + " (노예 " + slaveCount + "명)";
-            if (text.length() > 40) text = text.substring(0, 40);
-
-            objective.getScore(text).setScore(scoreIndex--);
-        }
     }
 }

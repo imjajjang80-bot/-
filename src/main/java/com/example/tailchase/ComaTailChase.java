@@ -45,10 +45,10 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
         }
     }
 
-    private final Map<UUID, UUID> masterMap = new HashMap<>(); // 노예 -> 주인
-    private final Map<UUID, List<UUID>> slavesMap = new HashMap<>(); // 주인 -> 노예 목록
-    private final Map<UUID, TailColor> colorMap = new HashMap<>(); // 플레이어 -> 색상
-    private final List<TailColor> activeColorOrder = new ArrayList<>(); // 게임 참가 색상 순서
+    private final Map<UUID, UUID> masterMap = new HashMap<>();
+    private final Map<UUID, List<UUID>> slavesMap = new HashMap<>();
+    private final Map<UUID, TailColor> colorMap = new HashMap<>();
+    private final List<TailColor> activeColorOrder = new ArrayList<>();
 
     private boolean gameStarted = false;
     private Scoreboard board;
@@ -118,10 +118,8 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
             colorMap.put(p.getUniqueId(), color);
             activeColorOrder.add(color);
 
-            // 이름표 색상 세팅
             setupNameTagColor(p, color);
 
-            // 1000x1000 (-450 ~ 450) 안의 안전한 랜덤 좌표로 텔레포트
             int x = random.nextInt(900) - 450;
             int z = random.nextInt(900) - 450;
             int y = overworld.getHighestBlockYAt(x, z) + 1;
@@ -139,7 +137,6 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
             p.setScoreboard(board);
         }
 
-        // 월드 보더 설정
         for (World world : Bukkit.getWorlds()) {
             WorldBorder border = world.getWorldBorder();
             border.setCenter(0, 0);
@@ -184,14 +181,15 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
     }
 
     private String getWorldNameFormatted(World.Environment env) {
-        return switch (env) {
-            case NETHER -> "네더(지옥)";
-            case THE_END -> "엔더 월드";
-            default -> "오버월드(오버월드)";
-        };
+        if (env == World.Environment.NETHER) {
+            return "네더(지옥)";
+        } else if (env == World.Environment.THE_END) {
+            return "엔더 월드";
+        } else {
+            return "오버월드";
+        }
     }
 
-    // 다이아몬드 우클릭 시 파란 불꽃 파티클 또는 차원 알림
     @EventHandler
     public void onPlayerInteract(PlayerInteractEvent event) {
         if (!gameStarted) return;
@@ -203,12 +201,10 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
                 Player targetPlayer = getValidNextTarget(player);
 
                 if (targetPlayer != null && targetPlayer.isOnline()) {
-                    // 다이아몬드 1개 소모
                     item.setAmount(item.getAmount() - 1);
 
                     TailColor targetColor = colorMap.get(targetPlayer.getUniqueId());
 
-                    // 다른 차원에 있는 경우 처리
                     if (!player.getWorld().equals(targetPlayer.getWorld())) {
                         String worldName = getWorldNameFormatted(targetPlayer.getWorld().getEnvironment());
                         player.sendMessage(ChatColor.GREEN + "[타깃 추적] " + targetColor.chatColor + targetColor.name + ChatColor.RED + " 타깃이 다른 차원(" + worldName + ")에 있습니다!");
@@ -216,7 +212,6 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
                         return;
                     }
 
-                    // 동일한 차원에 있는 경우 (파란 불꽃 파티클)
                     player.sendMessage(ChatColor.GREEN + "[타깃 추적] " + targetColor.chatColor + targetColor.name + ChatColor.GREEN + " 타깃 방향으로 3초간 파란 불꽃이 발사됩니다!");
                     player.playSound(player.getLocation(), Sound.BLOCK_SOUL_SAND_BREAK, 1.0f, 1.0f);
 
@@ -232,7 +227,6 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
                                 return;
                             }
 
-                            // 추적 도중 차원을 이동했을 경우 멈춤
                             if (!player.getWorld().equals(finalTarget.getWorld())) {
                                 this.cancel();
                                 return;
@@ -395,7 +389,7 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
 
         p.getInventory().setHelmet(helmet);
         p.getInventory().setChestplate(chest);
-        p.getInventory().setLeggings(leggings);
+        p.getInventory().setLeggings(legs);
         p.getInventory().setBoots(boots);
     }
 }

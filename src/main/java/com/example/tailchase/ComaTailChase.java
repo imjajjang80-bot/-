@@ -1,5 +1,7 @@
 package com.example.tailchase;
 
+import net.md_5.bungee.api.ChatMessageType;
+import net.md_5.bungee.api.chat.TextComponent;
 import org.bukkit.*;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
@@ -9,14 +11,19 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.entity.EntityDamageByEntityEvent;
+import org.bukkit.event.entity.EntityDamageEvent;
 import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
+import org.bukkit.event.player.PlayerMoveEvent;
 import org.bukkit.event.player.PlayerPortalEvent;
 import org.bukkit.event.player.PlayerTeleportEvent;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.inventory.meta.LeatherArmorMeta;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.potion.PotionEffect;
+import org.bukkit.potion.PotionEffectType;
 import org.bukkit.scheduler.BukkitRunnable;
+import org.bukkit.scheduler.BukkitTask;
 import org.bukkit.scoreboard.*;
 import org.bukkit.util.Vector;
 
@@ -50,14 +57,52 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
     private final Map<UUID, TailColor> colorMap = new HashMap<>();
     private final List<TailColor> activeColorOrder = new ArrayList<>();
 
+    // 기절(자연사) 관련 데이터 구조
+    private final Map<UUID, Long> downedPlayers = new HashMap<>();
+    private final Map<UUID, Location> downedLocations = new HashMap<>();
+
+    // 체인 이동 쿨타임 기록 (대장 텔레포트)
+    private final Map<UUID, Long> teleportCooldowns = new HashMap<>();
+
     private boolean gameStarted = false;
     private Scoreboard board;
     private final Random random = new Random();
+    private BukkitTask borderTask;
 
     @Override
     public void onEnable() {
         getServer().getPluginManager().registerEvents(this, this);
         Objects.requireNonNull(getCommand("꼬리")).setExecutor(this);
+
+        // 1초마다 기절한 플레이어 타이머 갱신 (액션바 표시 및 부활 처리)
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                if (!gameStarted) return;
+                long now = System.currentTimeMillis();
+                List<UUID> toRevive = new ArrayList<>();
+
+                for (Map.Entry<UUID, Long> entry : downedPlayers.entrySet()) {
+                    UUID uuid = entry.getKey();
+                    long endTime = entry.getValue();
+                    long leftSec = (endTime - now) / 1000;
+
+                    Player p = Bukkit.getPlayer(uuid);
+                    if (p != null && p.isOnline()) {
+                        if (leftSec > 0) {
+                            p.spigot().sendMessage(ChatMessageType.ACTION_BAR,
+                                    new TextComponent(ChatColor.RED + "☠ 기절 상태! 부활까지 " + ChatColor.YELLOW + leftSec + "초" + ChatColor.RED + " 남았습니다."));
+                        } else {
+                            toRevive.add(uuid);
+                        }
+                    }
+                }
+
+                for (UUID uuid : toRevive) {
+                    revivePlayer(uuid);
+                }
+            }
+        }.runTaskTimer(this, 0L, 20L);
 
         getLogger().info("마이콜 꼬리잡기 플러그인이 활성화되었습니다.");
     }
@@ -92,9 +137,15 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
                 stopGame();
                 Bukkit.broadcastMessage(ChatColor.RED + "[꼬리잡기] 게임이 강제 종료되었습니다.");
                 return true;
+            } else if (args[0].equalsIgnoreCase("집결")) {
+                if (!gameStarted) return true;
+                if (sender instanceof Player player) {
+                    handleTeamTeleport(player);
+                }
+                return true;
             }
         }
-        sender.sendMessage(ChatColor.YELLOW + "사용법: /꼬리 [시작|종료]");
+        sender.sendMessage(ChatColor.YELLOW + "사용법: /꼬리 [시작|종료|집결]");
         return true;
     }
 
@@ -104,6 +155,9 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
         slavesMap.clear();
         colorMap.clear();
         activeColorOrder.clear();
+        downedPlayers.clear();
+        downedLocations.clear();
+        teleportCooldowns.clear();
         initScoreboard();
 
         Collections.shuffle(players);
@@ -127,7 +181,9 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
 
             p.sendMessage(ChatColor.GRAY + "==============================");
             p.sendMessage(ChatColor.GOLD + " 당신의 색상: " + color.chatColor + color.name + ChatColor.GRAY + " (머리 위 이름표 색상 확인)");
-            p.sendMessage(ChatColor.AQUA + " [팁] 다이아몬드를 들고 우클릭하면 3초간 타깃 방향으로 파란 불꽃이 뻗어나갑니다!");
+            p.sendMessage(ChatColor.AQUA + " [팁] 다이아몬드 우클릭: 타깃 위치 추적 파란 불꽃 발사");
+            p.sendMessage(ChatColor.AQUA + " [팁] 나침반 우클릭: 대장 위치 추적 바늘 설정");
+            p.sendMessage(ChatColor.AQUA + " [팁] /꼬리 집결: 대장이 3분마다 팀원을 자신에게 텔레포트");
             p.sendMessage(ChatColor.GRAY + "==============================");
         }
 
@@ -137,11 +193,73 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
             p.setScoreboard(board);
         }
 
+        // 월드보더 초기화 및 타이머 시작 (5분마다 축소)
+        startWorldBorderShrink();
+    }
+
+    private void startWorldBorderShrink() {
         for (World world : Bukkit.getWorlds()) {
             WorldBorder border = world.getWorldBorder();
             border.setCenter(0, 0);
             border.setSize(1000);
         }
+
+        if (borderTask != null) borderTask.cancel();
+
+        borderTask = new BukkitRunnable() {
+            int step = 0;
+
+            @Override
+            public void run() {
+                if (!gameStarted) {
+                    this.cancel();
+                    return;
+                }
+
+                step++;
+                double newSize = Math.max(100, 1000 - (step * 150)); // 최저 100블록까지 축소
+
+                for (World world : Bukkit.getWorlds()) {
+                    WorldBorder border = world.getWorldBorder();
+                    border.setSize(newSize, 60); // 60초 동안 천천히 줄어듦
+                }
+
+                Bukkit.broadcastMessage(ChatColor.RED + "[경고] 월드보더가 축소됩니다! (현재 크기: " + (int) newSize + "x" + (int) newSize + ")");
+            }
+        }.runTaskTimer(this, 300 * 20L, 300 * 20L); // 5분(300초) 마다 실행
+    }
+
+    private void handleTeamTeleport(Player leader) {
+        UUID root = getRootMaster(leader.getUniqueId());
+
+        // 팀의 대장만 사용 가능
+        if (!root.equals(leader.getUniqueId())) {
+            leader.sendMessage(ChatColor.RED + "팀의 최종 대장만 팀원 집결 명령을 사용할 수 있습니다!");
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        long lastUsed = teleportCooldowns.getOrDefault(leader.getUniqueId(), 0L);
+        long cooldownTime = 180 * 1000; // 3분 쿨타임
+
+        if (now - lastUsed < cooldownTime) {
+            long leftSec = (cooldownTime - (now - lastUsed)) / 1000;
+            leader.sendMessage(ChatColor.RED + "집결 스킬 쿨타임 중입니다! (남은 시간: " + leftSec + "초)");
+            return;
+        }
+
+        teleportCooldowns.put(leader.getUniqueId(), now);
+        int count = 0;
+
+        for (Player p : Bukkit.getOnlinePlayers()) {
+            if (!p.equals(leader) && getRootMaster(p.getUniqueId()).equals(root)) {
+                p.teleport(leader.getLocation());
+                p.sendMessage(ChatColor.GREEN + "[체인 이동] 대장 " + leader.getName() + " 님의 위치로 텔레포트되었습니다!");
+                count++;
+            }
+        }
+
+        leader.sendMessage(ChatColor.GREEN + "[체인 이동] 팀원 " + count + "명을 자신 위치로 집결시켰습니다.");
     }
 
     private void setupNameTagColor(Player player, TailColor color) {
@@ -190,13 +308,113 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
         }
     }
 
+    // --- 자연사 처리 및 고정 이벤트 ---
+
+    @EventHandler
+    public void onPlayerDamage(EntityDamageEvent event) {
+        if (!gameStarted) return;
+
+        if (event.getEntity() instanceof Player victim) {
+            if (downedPlayers.containsKey(victim.getUniqueId())) {
+                event.setCancelled(true);
+                return;
+            }
+
+            if (victim.getHealth() - event.getFinalDamage() <= 0) {
+                if (victim.getKiller() == null) {
+                    event.setCancelled(true);
+                    enterDownedState(victim);
+                }
+            }
+        }
+    }
+
+    private void enterDownedState(Player player) {
+        UUID uuid = player.getUniqueId();
+        long endTime = System.currentTimeMillis() + (120 * 1000); // 120초
+
+        downedPlayers.put(uuid, endTime);
+        downedLocations.put(uuid, player.getLocation().clone());
+
+        player.setHealth(1.0);
+        player.addPotionEffect(new PotionEffect(PotionEffectType.SLOWNESS, 120 * 20, 255, false, false));
+        player.addPotionEffect(new PotionEffect(PotionEffectType.BLINDNESS, 120 * 20, 0, false, false));
+
+        player.sendMessage(ChatColor.RED + "[경고] 자연사하여 120초 동안 움직일 수 없게 됩니다.");
+        Bukkit.broadcastMessage(ChatColor.GRAY + "[알림] " + player.getName() + " 님이 자연사하여 기절 상태가 되었습니다.");
+    }
+
+    private void revivePlayer(UUID uuid) {
+        downedPlayers.remove(uuid);
+        downedLocations.remove(uuid);
+
+        Player player = Bukkit.getPlayer(uuid);
+        if (player != null && player.isOnline()) {
+            player.removePotionEffect(PotionEffectType.SLOWNESS);
+            player.removePotionEffect(PotionEffectType.BLINDNESS);
+
+            player.setHealth(Math.min(player.getHealth() + 4.0, player.getMaxHealth()));
+            player.setFoodLevel(20);
+
+            player.playEffect(EntityEffect.TOTEM_RESURRECT);
+            player.playSound(player.getLocation(), Sound.ITEM_TOTEM_USE, 1.0f, 1.0f);
+
+            player.sendMessage(ChatColor.GREEN + "[부활] 120초가 지나 부활했습니다!");
+            Bukkit.broadcastMessage(ChatColor.GREEN + "[알림] " + player.getName() + " 님이 기절에서 깨어났습니다.");
+        }
+    }
+
+    @EventHandler
+    public void onPlayerMove(PlayerMoveEvent event) {
+        if (!gameStarted) return;
+        Player p = event.getPlayer();
+        if (downedPlayers.containsKey(p.getUniqueId())) {
+            Location loc = downedLocations.get(p.getUniqueId());
+            if (loc != null) {
+                Location from = event.getFrom();
+                Location to = event.getTo();
+                if (to != null && (from.getX() != to.getX() || from.getY() != to.getY() || from.getZ() != to.getZ())) {
+                    loc.setYaw(to.getYaw());
+                    loc.setPitch(to.getPitch());
+                    event.setTo(loc);
+                }
+            }
+        }
+    }
+
     @EventHandler
     public void onPlayerInteract(PlayerInteractEvent event) {
         if (!gameStarted) return;
         Player player = event.getPlayer();
 
+        if (downedPlayers.containsKey(player.getUniqueId())) {
+            event.setCancelled(true);
+            return;
+        }
+
         if (event.getAction() == Action.RIGHT_CLICK_AIR || event.getAction() == Action.RIGHT_CLICK_BLOCK) {
             ItemStack item = event.getItem();
+
+            // 나침반 우클릭 - 대장 위치 추적 기능
+            if (item != null && item.getType() == Material.COMPASS) {
+                UUID rootUUID = getRootMaster(player.getUniqueId());
+                Player master = Bukkit.getPlayer(rootUUID);
+
+                if (master != null && master.isOnline()) {
+                    if (master.equals(player)) {
+                        player.sendMessage(ChatColor.YELLOW + "[나침반] 당신이 팀의 대장입니다!");
+                    } else if (!player.getWorld().equals(master.getWorld())) {
+                        player.sendMessage(ChatColor.RED + "[나침반] 대장(" + master.getName() + ") 님이 다른 차원에 있습니다.");
+                    } else {
+                        player.setCompassTarget(master.getLocation());
+                        double distance = Math.round(player.getLocation().distance(master.getLocation()) * 10.0) / 10.0;
+                        player.sendMessage(ChatColor.GREEN + "[나침반] 대장 " + master.getName() + " 님의 위치를 가리킵니다. (거리: " + distance + "블록)");
+                    }
+                }
+                return;
+            }
+
+            // 다이아몬드 우클릭 - 타깃 위치 불꽃 발사
             if (item != null && item.getType() == Material.DIAMOND) {
                 Player targetPlayer = getValidNextTarget(player);
 
@@ -275,10 +493,20 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
     }
 
     @EventHandler
-    public void onEntityDamage(EntityDamageByEntityEvent event) {
+    public void onEntityDamageByEntity(EntityDamageByEntityEvent event) {
         if (!gameStarted) return;
 
+        if (event.getEntity() instanceof Player victim && downedPlayers.containsKey(victim.getUniqueId())) {
+            event.setCancelled(true);
+            return;
+        }
+
         if (event.getEntity() instanceof Player victim && event.getDamager() instanceof Player attacker) {
+            if (downedPlayers.containsKey(attacker.getUniqueId())) {
+                event.setCancelled(true);
+                return;
+            }
+
             UUID attackerRoot = getRootMaster(attacker.getUniqueId());
             UUID victimRoot = getRootMaster(victim.getUniqueId());
 
@@ -312,7 +540,6 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
                 slavesMap.computeIfAbsent(killerRoot, k -> new ArrayList<>()).add(victimRoot);
 
                 TailColor masterColor = colorMap.get(killerRoot);
-
                 setLeatherArmor(victim, masterColor.armorColor);
 
                 String killerName = Bukkit.getPlayer(killerRoot) != null ? Bukkit.getPlayer(killerRoot).getName() : killer.getName();
@@ -356,19 +583,31 @@ public class ComaTailChase extends JavaPlugin implements Listener, CommandExecut
 
     private void stopGame() {
         gameStarted = false;
+        if (borderTask != null) borderTask.cancel();
+
         masterMap.clear();
         slavesMap.clear();
         colorMap.clear();
         activeColorOrder.clear();
+        downedPlayers.clear();
+        downedLocations.clear();
+        teleportCooldowns.clear();
 
         World overworld = Bukkit.getWorlds().get(0);
         int spawnY = overworld.getHighestBlockYAt(0, 0) + 1;
         Location spawnLoc = new Location(overworld, 0.5, spawnY, 0.5);
 
+        for (World world : Bukkit.getWorlds()) {
+            WorldBorder border = world.getWorldBorder();
+            border.setSize(30000000); // 월드보더 원래대로 해제
+        }
+
         for (Player p : Bukkit.getOnlinePlayers()) {
             p.getInventory().setArmorContents(null);
             p.setScoreboard(Bukkit.getScoreboardManager().getMainScoreboard());
             p.teleport(spawnLoc);
+            p.removePotionEffect(PotionEffectType.SLOWNESS);
+            p.removePotionEffect(PotionEffectType.BLINDNESS);
         }
     }
 
